@@ -105,7 +105,6 @@ from litellm.utils import (
     ProviderConfigManager,
     Usage,
     _get_model_info_helper,
-    get_requester_metadata,
     add_provider_specific_params_to_optional_params,
     async_mock_completion_streaming_obj,
     convert_to_model_response_object,
@@ -118,6 +117,7 @@ from litellm.utils import (
     get_optional_params_embeddings,
     get_optional_params_image_gen,
     get_optional_params_transcription,
+    get_requester_metadata,
     get_secret,
     get_standard_openai_params,
     mock_completion_streaming_obj,
@@ -156,6 +156,7 @@ from .llms.azure.audio_transcriptions import AzureAudioTranscription
 from .llms.azure.azure import AzureChatCompletion, _check_dynamic_azure_params
 from .llms.azure.chat.o_series_handler import AzureOpenAIO1ChatCompletion
 from .llms.azure.completion.handler import AzureTextCompletion
+from .llms.azure_ai.anthropic.handler import AzureAnthropicChatCompletion
 from .llms.azure_ai.embed import AzureAIEmbedding
 from .llms.bedrock.chat import BedrockConverseLLM, BedrockLLM
 from .llms.bedrock.embed.embedding import BedrockEmbedding
@@ -1682,57 +1683,109 @@ def completion(  # type: ignore # noqa: PLR0915
         elif custom_llm_provider == "azure_ai":
             from litellm.llms.azure_ai.common_utils import AzureFoundryModelInfo
 
-            api_base = AzureFoundryModelInfo.get_api_base(api_base)
-            # set API KEY
-            api_key = AzureFoundryModelInfo.get_api_key(api_key)
-
-            headers = headers or litellm.headers
-
-            if extra_headers is not None:
-                optional_params["extra_headers"] = extra_headers
-
-            ## FOR COHERE
-            if "command-r" in model:  # make sure tool call in messages are str
-                messages = stringify_json_tool_call_content(messages=messages)
-
-            ## COMPLETION CALL
-            try:
-                response = base_llm_http_handler.completion(
+            # Check if this is a Claude model - route to Azure Anthropic handler
+            model_lower = model.lower()
+            if "claude" in model_lower:
+                # Use Azure Anthropic handler for Claude models
+                api_base = AzureFoundryModelInfo.get_api_base(api_base)
+                if api_base is None:
+                    raise ValueError(
+                        "Azure Anthropic requests require an api_base. "
+                        "Set `api_base` or the AZURE_AI_API_BASE env var."
+                    )
+                api_key = AzureFoundryModelInfo.get_api_key(api_key)
+                
+                # Ensure the URL ends with /v1/messages for Anthropic
+                if api_base:
+                    api_base = api_base.rstrip("/")
+                    if not api_base.endswith("/v1/messages"):
+                        if "/anthropic" in api_base:
+                            parts = api_base.split("/anthropic", 1)
+                            api_base = parts[0] + "/anthropic"
+                        else:
+                            api_base = api_base + "/anthropic"
+                        api_base = api_base + "/v1/messages"
+                
+                response = azure_anthropic_chat_completions.completion(
                     model=model,
                     messages=messages,
-                    headers=headers,
-                    model_response=model_response,
-                    api_key=api_key,
                     api_base=api_base,
                     acompletion=acompletion,
-                    logging_obj=logging,
+                    custom_prompt_dict=litellm.custom_prompt_dict,
+                    model_response=model_response,
+                    print_verbose=print_verbose,
                     optional_params=optional_params,
                     litellm_params=litellm_params,
-                    shared_session=shared_session,
-                    timeout=timeout,  # type: ignore
-                    client=client,  # pass AsyncOpenAI, OpenAI client
-                    custom_llm_provider=custom_llm_provider,
+                    logger_fn=logger_fn,
                     encoding=encoding,
-                    stream=stream,
-                )
-            except Exception as e:
-                ## LOGGING - log the original exception returned
-                logging.post_call(
-                    input=messages,
                     api_key=api_key,
-                    original_response=str(e),
-                    additional_args={"headers": headers},
+                    logging_obj=logging,
+                    headers=headers,
+                    timeout=timeout,
+                    client=client,
+                    custom_llm_provider=custom_llm_provider,
                 )
-                raise e
+                if optional_params.get("stream", False) or acompletion is True:
+                    ## LOGGING
+                    logging.post_call(
+                        input=messages,
+                        api_key=api_key,
+                        original_response=response,
+                    )
+                response = response
+            else:
+                # Non-Claude models use standard Azure AI flow
+                api_base = AzureFoundryModelInfo.get_api_base(api_base)
+                # set API KEY
+                api_key = AzureFoundryModelInfo.get_api_key(api_key)
 
-            if optional_params.get("stream", False):
-                ## LOGGING
-                logging.post_call(
-                    input=messages,
-                    api_key=api_key,
-                    original_response=response,
-                    additional_args={"headers": headers},
-                )
+                headers = headers or litellm.headers
+
+                if extra_headers is not None:
+                    optional_params["extra_headers"] = extra_headers
+
+                ## FOR COHERE
+                if "command-r" in model:  # make sure tool call in messages are str
+                    messages = stringify_json_tool_call_content(messages=messages)
+
+                ## COMPLETION CALL
+                try:
+                    response = base_llm_http_handler.completion(
+                        model=model,
+                        messages=messages,
+                        headers=headers,
+                        model_response=model_response,
+                        api_key=api_key,
+                        api_base=api_base,
+                        acompletion=acompletion,
+                        logging_obj=logging,
+                        optional_params=optional_params,
+                        litellm_params=litellm_params,
+                        shared_session=shared_session,
+                        timeout=timeout,  # type: ignore
+                        client=client,  # pass AsyncOpenAI, OpenAI client
+                        custom_llm_provider=custom_llm_provider,
+                        encoding=encoding,
+                        stream=stream,
+                    )
+                except Exception as e:
+                    ## LOGGING - log the original exception returned
+                    logging.post_call(
+                        input=messages,
+                        api_key=api_key,
+                        original_response=str(e),
+                        additional_args={"headers": headers},
+                    )
+                    raise e
+
+                if optional_params.get("stream", False):
+                    ## LOGGING
+                    logging.post_call(
+                        input=messages,
+                        api_key=api_key,
+                        original_response=response,
+                        additional_args={"headers": headers},
+                    )
         elif (
             custom_llm_provider == "text-completion-openai"
             or "ft:babbage-002" in model
